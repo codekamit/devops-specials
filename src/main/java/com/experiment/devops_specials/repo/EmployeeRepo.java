@@ -11,6 +11,6 @@ import java.util.List;
 public interface EmployeeRepo extends JpaRepository<Employee, Long> {
     boolean existsByEmail(String email);
 
-    @Query("SELECT e FROM Employee e JOIN FETCH e.department")
+    @Query("SELECT e FROM Employee e LEFT JOIN FETCH e.department")
     List<Employee> getAllEmployees();
 }
