@@ -56,4 +56,4 @@ jobs:
       - name: Force Minikube to pull the new image
         # This restarts the pods, forcing them to pull the 'latest' tag you just pushed
         run: |
-          kubectl rollout restart deployment/your-java-app-deployment-name
+          kubectl rollout restart deployment/devops-special-app
