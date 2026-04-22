@@ -14,10 +14,10 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Set up JDK 26
         uses: actions/setup-java@v4
         with:
-          java-version: '17' # Change to match your Java version
+          java-version: '26' # Change to match your Java version
           distribution: 'temurin'
           cache: maven
 
@@ -37,8 +37,8 @@ jobs:
           push: true
           # Tags it with both 'latest' and the specific git commit hash
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/your-repo-name:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/your-repo-name:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/devops_specials_k8:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/devops_specials_k8:${{ github.sha }}
 
   # --- CD JOB (Runs on your Local Machine) ---
   deploy-to-minikube:
