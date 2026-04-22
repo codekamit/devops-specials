@@ -51,7 +51,7 @@ jobs:
       - name: Apply Kubernetes Manifests
         # Assumes your kubectl context is already set to minikube locally
         run: |
-          kubectl apply -f k8s/
+          kubectl apply -f k8s/dev/kubeconfig-dev.yml
 
       - name: Force Minikube to pull the new image
         # This restarts the pods, forcing them to pull the 'latest' tag you just pushed
