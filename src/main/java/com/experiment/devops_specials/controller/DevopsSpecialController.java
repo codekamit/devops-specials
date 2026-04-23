@@ -12,10 +12,10 @@ public class DevopsSpecialController {
 
     @GetMapping("goal")
     public String getDevopsGoal() {
-        log.info("A request to fetch goal has come");
+        log.info("A request to fetch goal has come from another computed");
         if(this.devOpsGoal == null) {
             log.debug("Goal is not set yet");
-            return "Let's kick in my development journey with automated CICD pipeline";
+            return "Let's kick in my development journey with automated CICD pipeline. This is from another computer";
         }
         log.info("Goal : {}", this.devOpsGoal);
         return this.devOpsGoal;
