@@ -15,7 +15,7 @@ public class DevopsSpecialController {
         log.info("A request to fetch goal has come");
         if(this.devOpsGoal == null) {
             log.debug("Goal is not set yet");
-            return "Let's kick in my development journey with automated CICD pipeline";
+            return "HIP HIP HURREY!!";
         }
         log.info("Goal : {}", this.devOpsGoal);
         return this.devOpsGoal;
