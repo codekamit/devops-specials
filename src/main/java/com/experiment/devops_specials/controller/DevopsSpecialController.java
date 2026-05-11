@@ -15,7 +15,7 @@ public class DevopsSpecialController {
         log.info("A request to fetch goal has come");
         if(this.devOpsGoal == null) {
             log.debug("Goal is not set yet");
-            return "HIP HIP HURREY VERSION 2!!";
+            return "HIP HIP HURREY 5555!";
         }
         log.info("Goal : {}", this.devOpsGoal);
         return this.devOpsGoal;
