@@ -1,63 +1,274 @@
-name: Java CI/CD Pipeline
+# =============================================================================
+# Production CI/CD — Java/Maven microservice
+# Save as: .github/workflows/ci-cd.yml
+#
+# ASSUMPTIONS (swap these for your stack, see inline notes):
+#   - Build tool:        Maven (pom.xml at repo root)
+#   - Container registry: GHCR (ghcr.io) — uses the built-in GITHUB_TOKEN,
+#                          no extra secret needed. Swap for ECR/ACR/Docker Hub
+#                          by changing the `docker/login-action` step.
+#   - Deploy target:      Kubernetes via Helm chart at ./charts/<service>.
+#                          Swap for ECS/App Runner/Lambda by replacing the
+#                          `deploy-staging` / `deploy-production` steps.
+#
+# REQUIRED SECRETS:
+#   STAGING_KUBECONFIG      - base64-encoded kubeconfig for staging cluster
+#   PRODUCTION_KUBECONFIG   - base64-encoded kubeconfig for prod cluster
+#   SONAR_TOKEN             - optional, for SonarCloud
+#   SLACK_WEBHOOK_URL       - optional, for deploy notifications
+#
+# REQUIRED REPO SETUP:
+#   - Settings > Environments > create "staging" and "production".
+#   - On "production", enable "Required reviewers" — this is what turns the
+#     prod deploy job into a manual approval gate.
+# =============================================================================
 
-# Trigger the workflow when code is merged into the 'develop' branch
+name: Production CI/CD
+
 on:
   push:
-    branches:
-      - develop
+    branches: [main, develop]
+    tags: ['v*.*.*']
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch: {}
+
+# Least-privilege by default; only grant what each job actually needs via
+# job-level `permissions:` overrides if you want to be even stricter.
+permissions:
+  contents: read
+  packages: write        # push images to GHCR
+  id-token: write        # OIDC — keyless cosign signing / cloud auth
+  security-events: write # upload SARIF to the Security tab
+
+# Cancel superseded runs on the same branch so PRs don't queue stale builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: '21'
+  JAVA_DISTRIBUTION: 'temurin'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  # --- CI JOB (Runs in the GitHub Cloud) ---
-  build-and-push:
+  # ---------------------------------------------------------------------------
+  test:
+    name: Unit & Integration Tests
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 26
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
-          java-version: '26' # Change to match your Java version
-          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
           cache: maven
+      - name: Run tests with coverage
+        run: mvn -B verify -Pcoverage   # assumes a jacoco 'coverage' profile
+      - name: Publish test report
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: Maven Tests
+          path: '**/surefire-reports/*.xml'
+          reporter: java-junit
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: '**/target/site/jacoco/jacoco.xml'
 
-      - name: Build and Test with Maven
-        run: mvn clean package
+  # ---------------------------------------------------------------------------
+  static-analysis:
+    name: Lint & Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed for SonarCloud's diff analysis
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+      - name: Checkstyle
+        run: mvn -B checkstyle:check
+      - name: SpotBugs
+        run: mvn -B spotbugs:check
+      - name: SonarCloud scan
+        if: env.SONAR_TOKEN != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        run: mvn -B sonar:sonar -Dsonar.projectKey=${{ github.repository }}
 
-      - name: Extract Maven Project Version
-        id: get_version
-        run: echo "VERSION=$(mvn -q -Dexec.executable=echo -Dexec.args='${project.version}' --non-recursive exec:exec)" >> $GITHUB_ENV
+  # ---------------------------------------------------------------------------
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+      - name: OWASP Dependency-Check
+        run: mvn -B org.owasp:dependency-check-maven:check -DfailBuildOnCVSS=7 -Dformat=SARIF
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: target/dependency-check-report.sarif
 
-      - name: Log in to Docker Hub
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build & Push Image
+    needs: [test, static-analysis, dependency-scan]
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.version }}
+      image_digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: ${{ env.JAVA_DISTRIBUTION }}
+          cache: maven
+      - name: Build jar
+        run: mvn -B package -DskipTests   # tests already ran in the `test` job
+
+      - name: Log in to registry
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and Push Docker Image
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=,format=long
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        id: push
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
-          # Tags it with both 'latest' and the specific git commit hash
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/devops_specials_k8:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/devops_specials_k8:v${{ env.VERSION }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64,linux/arm64
 
-  # --- CD JOB (Runs on your Local Machine) ---
-  deploy-to-minikube:
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.spdx.json
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless, via OIDC)
+        run: cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+
+  # ---------------------------------------------------------------------------
+  scan-image:
+    name: Container Image Scan
     needs: build-and-push
-    runs-on: self-hosted # This tells GitHub to use your local machine!
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ needs.build-and-push.outputs.image_digest }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: CRITICAL,HIGH
+          exit-code: 1   # fail the pipeline on critical/high CVEs
+      - name: Upload Trivy results
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
 
-      - name: Apply Kubernetes Manifests
-        # Assumes your kubectl context is already set to minikube locally
+  # ---------------------------------------------------------------------------
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build-and-push, scan-image]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: https://staging.example.com
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure kubeconfig
         run: |
-          kubectl apply -f k8s/dev/kubeconfig-dev.yml
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.STAGING_KUBECONFIG }}" | base64 -d > "$HOME/.kube/config"
+      - name: Deploy with Helm
+        run: |
+          helm upgrade --install my-service ./charts/my-service \
+            --namespace staging --create-namespace \
+            --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --set image.tag=${{ needs.build-and-push.outputs.image_tag }} \
+            --wait --timeout 5m
+      - name: Smoke test
+        run: curl -sf --retry 5 --retry-delay 5 https://staging.example.com/actuator/health
 
-      - name: Force Minikube to pull the new image
-        # This restarts the pods, forcing them to pull the 'latest' tag you just pushed
+  # ---------------------------------------------------------------------------
+  deploy-production:
+    name: Deploy to Production
+    needs: [deploy-staging]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: production   # required reviewers on this Environment = the approval gate
+      url: https://api.example.com
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure kubeconfig
         run: |
-          kubectl rollout restart deployment/devops-special-app
+          mkdir -p "$HOME/.kube"
+          echo "${{ secrets.PRODUCTION_KUBECONFIG }}" | base64 -d > "$HOME/.kube/config"
+      - name: Deploy with Helm
+        id: deploy
+        run: |
+          helm upgrade --install my-service ./charts/my-service \
+            --namespace production --create-namespace \
+            --set image.repository=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} \
+            --set image.tag=${{ needs.build-and-push.outputs.image_tag }} \
+            --atomic --wait --timeout 5m
+      - name: Post-deploy health check
+        run: curl -sf --retry 5 --retry-delay 10 https://api.example.com/actuator/health
+      - name: Rollback on failure
+        if: failure() && steps.deploy.outcome == 'failure'
+        run: helm rollback my-service --namespace production
+      - name: Notify Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1.27.0
+        with:
+          payload: |
+            {"text": "Production deploy ${{ job.status }} for ${{ github.repository }} @ ${{ needs.build-and-push.outputs.image_tag }}"}
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
